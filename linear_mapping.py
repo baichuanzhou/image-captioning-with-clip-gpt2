@@ -2,11 +2,30 @@ from config import LinearMappingConfig
 from transformers import (
     GPT2TokenizerFast, GPT2LMHeadModel, AutoModel,
     CLIPVisionModel, AutoProcessor, BatchEncoding,
-
 )
+from transformers.models.gpt2.modeling_gpt2 import GPT2DoubleHeadsModelOutput
 import torch
 import torch.nn as nn
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple, Dict
+from torchvision.transforms import CenterCrop, ConvertImageDtype, Normalize, Resize
+from torchvision.transforms.functional import InterpolationMode
+
+
+class Transform(torch.nn.Module):
+    def __init__(self, image_size, mean, std):
+        super().__init__()
+        self.transforms = torch.nn.Sequential(
+            Resize([image_size], interpolation=InterpolationMode.BICUBIC, antialias=True),
+            CenterCrop(image_size),
+            ConvertImageDtype(torch.float32),
+            Normalize(mean, std),
+        )
+
+    def forward(self, x) -> torch.Tensor:
+        """`x` should be an instance of `PIL.Image.Image`"""
+        with torch.no_grad():
+            x = self.transforms(x)
+        return x
 
 
 class LinearMappingProcessor:
@@ -113,58 +132,109 @@ class LinearMapping(nn.Module):
             self,
             input_ids: Optional[torch.Tensor],
             pixel_values: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict:
         """
         Prepare captions and pixel values for training.
         It takes the captions' input ids and turn them into input embeddings
         and turns pixel values into prefix prompts.
         Then it concatenates them into one whole prompt batch.
         """
-        text_embeddings = self.prepare_text_inputs(input_ids)  # B x T x D
-        prefix_prompts = self.image_prefix(pixel_values)  # B x V x D
-        inputs_embeddings = torch.cat([prefix_prompts, text_embeddings], dim=1)
+        if input_ids is not None and pixel_values is not None:
 
-        prefix_labels = torch.zeros(prefix_prompts.shape[:2], device=prefix_prompts.device) - 100
-        labels = torch.cat([prefix_labels, input_ids], dim=1)   # B x (V + T)
-        # We also need to mask out padding token, which is the eos tokens after the first eos token in each sequence
-        eos_mask = labels == self.tokenizer.eos_token_id
-        # count the number of eos token in each sequence, should be of batch size
-        count_eos = eos_mask.sum(dim=1)     # B
-        # use this to calculate the position of the first eos token in each sequence and do not mask that
-        first_eos_pos = labels.size(1) - count_eos     # B
-        # mask out the eos tokens
-        labels[eos_mask] = -100
-        # the first eos token should not be masked
-        labels[range(labels.size(0)), first_eos_pos.long()] = self.tokenizer.eos_token_id
-        return inputs_embeddings, labels.to(dtype=torch.long)
+            text_embeddings = self.prepare_text_inputs(input_ids)  # B x T x D
+            prefix_prompts = self.image_prefix(pixel_values)  # B x V x D
+            inputs_embeddings = torch.cat([prefix_prompts, text_embeddings], dim=1)
+
+            prefix_labels = torch.zeros(prefix_prompts.shape[:2], device=prefix_prompts.device) - 100
+            labels = torch.cat([prefix_labels, input_ids], dim=1)   # B x (V + T)
+
+            for label in labels:
+                for k, token in enumerate(label):
+                    if token == self.tokenizer.eos_token_id:
+                        label[k + 1:] = -100
+                        break
+            return {"hidden_states": inputs_embeddings, "labels": labels.to(dtype=torch.int64)}
+
+        elif pixel_values is not None:
+            prefix_prompts = self.image_prefix(pixel_values)  # B x V x D
+            prefix_labels = torch.zeros(prefix_prompts.shape[:2], device=prefix_prompts.device) - 100
+            return {"hidden_states": prefix_prompts, "labels": prefix_labels.to(dtype=torch.int64)}
+
+        elif input_ids is not None:
+            text_embeddings = self.prepare_text_inputs(input_ids)
+            labels = input_ids.clone()
+            for label in labels:
+                for k, token in enumerate(label):
+                    if token == self.tokenizer.eos_token_id:
+                        label[k + 1:] = -100
+                        break
+            return {"hidden_states": text_embeddings, "labels": labels.to(dtype=torch.int64)}
+        else:
+            return {"hidden_states": None, "labels": None}
+
+    def generate(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            pixel_values: Optional[torch.Tensor] = None,
+            **kwargs
+    ):
+        print("input_ids", input_ids)
+        batch_size = input_ids.size(0)
+        first_forward_outputs = self.forward(
+            input_ids=input_ids,
+            pixel_values=pixel_values
+        )
+        past_key_values = first_forward_outputs.past_key_values
+        print(past_key_values[0][0].size())
+
+        first_token_id = first_forward_outputs.logits[:, -1].argmax(-1)
+        first_token_id = first_token_id.view(batch_size, -1)
+        print("first token id", first_token_id)
+        if kwargs.get("attention_mask", None) is None:
+            past_attention_mask_size = (past_key_values[0][0].size(0), past_key_values[0][0].size(-2))
+            attention_mask_size = (past_attention_mask_size[0], past_attention_mask_size[-1] + first_token_id.size(-1))
+            print(attention_mask_size)
+            attention_mask = torch.zeros(attention_mask_size, dtype=torch.int64)
+            print(attention_mask)
+        else:
+            attention_mask = kwargs.pop("attention_mask")
+            attention_mask = torch.cat([attention_mask, torch.ones(first_token_id.size())], dim=-1)
+        rest_token_ids = self.language_model.generate(
+            past_key_values=past_key_values,
+            input_ids=first_token_id,
+            attention_mask=attention_mask,
+            **kwargs
+        )
+        generated_token_ids = torch.cat([input_ids, rest_token_ids], dim=-1)
+        return generated_token_ids
 
     def forward(
             self,
-            input_ids: torch.Tensor,
-            pixel_values: torch.Tensor,
+            input_ids: Optional[torch.Tensor] = None,
+            pixel_values: Optional[torch.Tensor] = None,
             labels: Optional[torch.Tensor] = None,
             inputs_embeds: Optional[torch.Tensor] = None,
             output_hidden_states: bool = True,
             output_attentions: bool = True,
             attention_mask: Optional[torch.Tensor] = None,
-            return_dict: Optional[bool] = True
-    ) -> Union[Tuple]:
+            return_dict: Optional[bool] = True,
+            **kwargs
+    ) -> Union[GPT2DoubleHeadsModelOutput, Tuple]:
         if (pixel_values is None and input_ids is None) and inputs_embeds is None:
             raise ValueError("You have to specify inputs")
         if inputs_embeds is not None and (pixel_values is not None or input_ids is not None):
             raise ValueError("Either inputs_embeds or (pixel_values and input_ids) should be specified, not both")
 
-        hidden_states, input_labels = self.prepare_inputs(input_ids, pixel_values)
-        if labels is not None:
-            input_labels = labels
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-
+        inputs = self.prepare_inputs(input_ids, pixel_values)
+        hidden_states = inputs.get('hidden_states', None) if inputs_embeds is None else inputs_embeds
+        labels = inputs.get('labels', None) if labels is None else labels
+        print(hidden_states.size())
         return self.language_model(
             inputs_embeds=hidden_states,
-            labels=input_labels,
+            labels=labels,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             attention_mask=attention_mask,
-            return_dict=return_dict
+            return_dict=return_dict,
+            **kwargs
         )
