@@ -36,7 +36,8 @@ class LinearMappingProcessor:
     def __init__(self, config: LinearMappingConfig):
         self.image_processor = AutoProcessor.from_pretrained(config.image_model)
         self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-        self.tokenizer.add_special_tokens({"cls_token": "|<image>|"})
+        if config.add_image_token:
+            self.tokenizer.add_special_tokens({"cls_token": "|<image>|"})
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = "right"
         self.prefix_length = config.prefix_length
@@ -45,22 +46,31 @@ class LinearMappingProcessor:
         """
         The processor assumes that images and texts are of the same number
         """
-        if texts is None and images is None:
-            raise ValueError("You have to specify either text or images. Both cannot be none.")
 
-        if texts is not None:
-            encoding = self.tokenizer(texts, return_tensors=return_tensors, **kwargs)
+        if texts is None and images is None:
+            raise ValueError("You have to specify either text or images. They cannot be none at the same time.")
+
+        if len(texts) == 0:     # empty strings should be None
+            texts = None
 
         if images is not None:
             image_features = self.image_processor(images=images, return_tensors=return_tensors, **kwargs)
+            image_features["attention_mask"] = torch.ones(image_features.pixel_values.size(0),
+                                                          self.prefix_length).to(dtype=torch.int64)
+
+        if images is None and texts is None:
+            texts = self.tokenizer.bos_token
+
+        if texts is not None:
+            encoding = self.tokenizer(texts, return_tensors=return_tensors, **kwargs)
 
         if texts is not None and images is not None:
             encoding["pixel_values"] = image_features.pixel_values
 
             encoding["attention_mask"] = torch.cat([
-                torch.ones(image_features.pixel_values.size(0), self.prefix_length),
+                image_features["attention_mask"],
                 encoding["attention_mask"]
-            ], dim=1).to(dtype=torch.long)   # create attention mask for images
+            ], dim=1).to(dtype=torch.long)  # create attention mask for images
             return encoding
 
         elif texts is not None:
@@ -115,18 +125,27 @@ class LinearMapping(nn.Module):
         super().__init__()
         self.image_prefix = ImagePrefix(config)
         self.language_model = GPT2LMHeadModel.from_pretrained(config.text_model)
-
-        if config.freeze_text_model:
-            for param in self.language_model.parameters():
-                param.requires_grad = False
-
         self.processor = LinearMappingProcessor(config)
         self.tokenizer = self.processor.tokenizer
         self.image_processor = self.processor.image_processor
-        self.language_model.resize_token_embeddings(len(self.tokenizer))
+        if config.add_image_token:
+            self.language_model.resize_token_embeddings(len(self.tokenizer))
+
+        if config.freeze_text_model:
+            for module in self.language_model.modules():
+                if not isinstance(module, nn.LayerNorm) or config.freeze_ln:
+                    for param in module.parameters():
+                        param.requires_grad = False
+            if config.add_image_token:
+                # create a gradient mask for the lm_head weight and bias and hook it
+                self.language_model.lm_head.weight.requires_grad = True
+                self.weight_gradient_mask = nn.Parameter(torch.zeros_like(self.language_model.lm_head.weight),
+                                                         requires_grad=False)
+                self.weight_gradient_mask[-1, :] = 1.0
+                self.language_model.lm_head.weight.register_hook(lambda grad: grad.mul_(self.weight_gradient_mask))
 
     def prepare_text_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.language_model.transformer.wte(input_ids)
+        return self.language_model.transformer.wte(input_ids.to(dtype=torch.int64))
 
     def prepare_inputs(
             self,
@@ -146,7 +165,7 @@ class LinearMapping(nn.Module):
             inputs_embeddings = torch.cat([prefix_prompts, text_embeddings], dim=1)
 
             prefix_labels = torch.zeros(prefix_prompts.shape[:2], device=prefix_prompts.device) - 100
-            labels = torch.cat([prefix_labels, input_ids], dim=1)   # B x (V + T)
+            labels = torch.cat([prefix_labels, input_ids], dim=1)  # B x (V + T)
 
             for label in labels:
                 for k, token in enumerate(label):
@@ -172,40 +191,43 @@ class LinearMapping(nn.Module):
         else:
             return {"hidden_states": None, "labels": None}
 
+    @torch.no_grad()
     def generate(
             self,
             input_ids: Optional[torch.Tensor] = None,
             pixel_values: Optional[torch.Tensor] = None,
             **kwargs
     ):
-        print("input_ids", input_ids)
-        batch_size = input_ids.size(0)
+        if pixel_values is None:
+            return self.language_model.generate(
+                input_ids=input_ids,
+                **kwargs
+            )
         first_forward_outputs = self.forward(
             input_ids=input_ids,
             pixel_values=pixel_values
         )
         past_key_values = first_forward_outputs.past_key_values
-        print(past_key_values[0][0].size())
+        batch_size = past_key_values[0][0].size()[0]
 
         first_token_id = first_forward_outputs.logits[:, -1].argmax(-1)
         first_token_id = first_token_id.view(batch_size, -1)
-        print("first token id", first_token_id)
+
         if kwargs.get("attention_mask", None) is None:
             past_attention_mask_size = (past_key_values[0][0].size(0), past_key_values[0][0].size(-2))
             attention_mask_size = (past_attention_mask_size[0], past_attention_mask_size[-1] + first_token_id.size(-1))
-            print(attention_mask_size)
             attention_mask = torch.zeros(attention_mask_size, dtype=torch.int64)
-            print(attention_mask)
         else:
             attention_mask = kwargs.pop("attention_mask")
             attention_mask = torch.cat([attention_mask, torch.ones(first_token_id.size())], dim=-1)
-        rest_token_ids = self.language_model.generate(
+        generated_token_ids = self.language_model.generate(
             past_key_values=past_key_values,
             input_ids=first_token_id,
             attention_mask=attention_mask,
             **kwargs
         )
-        generated_token_ids = torch.cat([input_ids, rest_token_ids], dim=-1)
+        if input_ids is not None:
+            generated_token_ids = torch.cat([input_ids, generated_token_ids], dim=-1)
         return generated_token_ids
 
     def forward(
@@ -228,7 +250,7 @@ class LinearMapping(nn.Module):
         inputs = self.prepare_inputs(input_ids, pixel_values)
         hidden_states = inputs.get('hidden_states', None) if inputs_embeds is None else inputs_embeds
         labels = inputs.get('labels', None) if labels is None else labels
-        print(hidden_states.size())
+
         return self.language_model(
             inputs_embeds=hidden_states,
             labels=labels,
