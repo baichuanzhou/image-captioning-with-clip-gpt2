@@ -26,6 +26,8 @@ def main():
 
     def tokenize_fn(examples):
         texts = list(examples[CAPTION_COLUMN])
+        if config.add_image_token:
+            texts = list(processor.tokenizer.cls_token + text for text in texts)
         inputs = processor.tokenizer(
             texts, padding="max_length", max_length=77,
             return_tensors="pt", truncation=True
