@@ -27,7 +27,7 @@ def generate_image_captions(image, text):
         max_new_tokens=50
     )
 
-    prediction_text = processor.decode(prediction[0], num_beams=3, skip_special_tokens=True)
+    prediction_text = processor.decode(prediction[0], num_beams=5, skip_special_tokens=True)
     return prediction_text
 
 
@@ -35,7 +35,7 @@ article = "This demo is originated from this paper: [original paper](https://arx
 description = """
 ### Expand GPT2's language capabilities to vision with CLIP!
 """
-gr.Interface(
+demo = gr.Interface(
     fn=generate_image_captions,
     inputs=[
         gr.Image(),
@@ -43,23 +43,14 @@ gr.Interface(
     ],
     outputs="text",
     examples=[
-        [os.path.join(os.getcwd(), 'two_cats.jpg'), "A picture of"],
-        [os.path.join(os.getcwd(), 'dog_with_hat.png'), ""],
-        [os.path.join(os.getcwd(), 'stop_sign.png'), "What does the sign say?"]
+        [os.path.join(os.getcwd(), 'two_bear.png'), ""],
+        [os.path.join(os.getcwd(), 'cat_with_food.png'), "Describe the picture:"],
+        [os.path.join(os.getcwd(), 'dog_with_frisbee.png'), "What is the color of the frisbee in the photo? Answer:"],
+        [os.path.join(os.getcwd(), 'stop_sign.png'), "What does the sign in the picture say? Answer:"]
     ],
     article=article,
     title=title,
     description=description
-).launch()
+)
 
-# with gr.Blocks() as demo:
-#     gr.Markdown("# " + title)
-#     with gr.Row():
-#         with gr.Column():
-#             input_image = gr.Image()
-#             input_text = gr.Textbox(placeholder="A picture of", label="Input Text", lines=3)
-#             generate_button = gr.Button(value="Generate")
-#         output_text = gr.Textbox(label="Output Text", lines=3)
-#         generate_button.click(fn=generate_image_captions, inputs=[input_image, input_text], outputs=output_text)
-#
-# demo.launch()
+demo.launch(share=True)
