@@ -2,6 +2,7 @@ from config import LinearMappingConfig
 from transformers import (
     GPT2TokenizerFast, GPT2LMHeadModel, AutoModel,
     CLIPVisionModel, AutoProcessor, BatchEncoding,
+    AutoConfig, CLIPVisionConfig
 )
 from transformers.models.gpt2.modeling_gpt2 import GPT2DoubleHeadsModelOutput
 import torch
@@ -36,6 +37,7 @@ class LinearMappingProcessor:
     def __init__(self, config: LinearMappingConfig):
         self.image_processor = AutoProcessor.from_pretrained(config.image_model)
         self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        self.add_image_token = config.add_image_token
         if config.add_image_token:
             self.tokenizer.add_special_tokens({"cls_token": "|<image>|"})
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -47,9 +49,6 @@ class LinearMappingProcessor:
         The processor assumes that images and texts are of the same number
         """
 
-        if texts is None and images is None:
-            raise ValueError("You have to specify either text or images. They cannot be none at the same time.")
-
         if len(texts) == 0:     # empty strings should be None
             texts = None
 
@@ -57,8 +56,14 @@ class LinearMappingProcessor:
             image_features = self.image_processor(images=images, return_tensors=return_tensors, **kwargs)
             image_features["attention_mask"] = torch.ones(image_features.pixel_values.size(0),
                                                           self.prefix_length).to(dtype=torch.int64)
+            if texts is None and self.add_image_token:
+                texts = [self.tokenizer.cls_token for _ in range(image_features.pixel_values.size(0))]
+            elif texts is not None and self.add_image_token:
+                if isinstance(texts, str):
+                    texts = [texts]
+                texts = [self.tokenizer.cls_token + text for text in texts]
 
-        if images is None and texts is None:
+        elif texts is None:
             texts = self.tokenizer.bos_token
 
         if texts is not None:
@@ -100,9 +105,11 @@ class ImagePrefix(nn.Module):
 
     def __init__(self, config: LinearMappingConfig):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(config.image_model)
-        if "clip" in config.image_model:
-            self.encoder = CLIPVisionModel.from_pretrained(config.image_model)
+        clip_config = CLIPVisionConfig.from_pretrained(config.image_model)
+
+        self.encoder = CLIPVisionModel(clip_config)
+        if config.image_from_pretrained:
+            self.encoder = self.encoder.from_pretrained(config.image_model)
 
         if config.freeze_image_model:
             for param in self.encoder.parameters():
@@ -124,10 +131,13 @@ class LinearMapping(nn.Module):
     def __init__(self, config: LinearMappingConfig):
         super().__init__()
         self.image_prefix = ImagePrefix(config)
-        self.language_model = GPT2LMHeadModel.from_pretrained(config.text_model)
+        self.language_model = GPT2LMHeadModel(AutoConfig.from_pretrained(config.text_model))
+        if config.text_from_pretrained:
+            self.language_model = self.language_model.from_pretrained(config.text_model)
         self.processor = LinearMappingProcessor(config)
         self.tokenizer = self.processor.tokenizer
         self.image_processor = self.processor.image_processor
+        self.add_image_token = config.add_image_token
         if config.add_image_token:
             self.language_model.resize_token_embeddings(len(self.tokenizer))
 
@@ -198,36 +208,50 @@ class LinearMapping(nn.Module):
             pixel_values: Optional[torch.Tensor] = None,
             **kwargs
     ):
+        in_training = self.training
+        self.eval()
         if pixel_values is None:
             return self.language_model.generate(
                 input_ids=input_ids,
                 **kwargs
             )
-        first_forward_outputs = self.forward(
-            input_ids=input_ids,
-            pixel_values=pixel_values
-        )
-        past_key_values = first_forward_outputs.past_key_values
-        batch_size = past_key_values[0][0].size()[0]
+        batch_size = pixel_values.size(0)
+        past_input_ids = None
+        if input_ids is None:
+            if self.add_image_token:
+                input_ids = torch.tensor([self.tokenizer.cls_token_id for _ in range(batch_size)]).view(batch_size, -1)
+            else:
+                input_ids = torch.tensor([self.tokenizer.bos_token_id for _ in range(batch_size)]).view(batch_size, -1)
+        if input_ids.size(-1) <= 1:
+            first_forward_outputs = self.forward(
+                pixel_values=pixel_values
+            )
+        else:
+            first_forward_outputs = self.forward(
+                pixel_values=pixel_values,
+                input_ids=input_ids[:, :-1]
+            )
+            past_input_ids = input_ids[:, :-1]
+            input_ids = input_ids[:, -1].view(batch_size, -1)
 
-        first_token_id = first_forward_outputs.logits[:, -1].argmax(-1)
-        first_token_id = first_token_id.view(batch_size, -1)
+        past_key_values = first_forward_outputs.past_key_values
 
         if kwargs.get("attention_mask", None) is None:
-            past_attention_mask_size = (past_key_values[0][0].size(0), past_key_values[0][0].size(-2))
-            attention_mask_size = (past_attention_mask_size[0], past_attention_mask_size[-1] + first_token_id.size(-1))
-            attention_mask = torch.zeros(attention_mask_size, dtype=torch.int64)
+            attention_mask_size = (past_key_values[0][0].size(0), past_key_values[0][0].size(-2))
+
+            attention_mask = torch.ones(attention_mask_size, dtype=torch.int64)
         else:
             attention_mask = kwargs.pop("attention_mask")
-            attention_mask = torch.cat([attention_mask, torch.ones(first_token_id.size())], dim=-1)
+
         generated_token_ids = self.language_model.generate(
             past_key_values=past_key_values,
-            input_ids=first_token_id,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             **kwargs
         )
-        if input_ids is not None:
-            generated_token_ids = torch.cat([input_ids, generated_token_ids], dim=-1)
+        if past_input_ids is not None:
+            generated_token_ids = torch.cat([past_input_ids, generated_token_ids], dim=-1)
+        self.train(in_training)
         return generated_token_ids
 
     def forward(
