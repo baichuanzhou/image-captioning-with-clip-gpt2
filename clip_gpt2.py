@@ -1,41 +1,25 @@
-from config import LinearMappingConfig
+from config import CLIPGPT2Config
 from transformers import (
-    GPT2TokenizerFast, GPT2LMHeadModel, AutoModel,
-    CLIPVisionModel, AutoProcessor, BatchEncoding,
+    GPT2TokenizerFast, GPT2LMHeadModel,
+    CLIPVisionModel, BatchEncoding,
+    CLIPImageProcessor,
     AutoConfig, CLIPVisionConfig
 )
 from transformers.models.gpt2.modeling_gpt2 import GPT2DoubleHeadsModelOutput
 import torch
 import torch.nn as nn
 from typing import List, Optional, Union, Tuple, Dict
-from torchvision.transforms import CenterCrop, ConvertImageDtype, Normalize, Resize
-from torchvision.transforms.functional import InterpolationMode
+
+EOS_TOKEN_ID = 50256
 
 
-class Transform(torch.nn.Module):
-    def __init__(self, image_size, mean, std):
-        super().__init__()
-        self.transforms = torch.nn.Sequential(
-            Resize([image_size], interpolation=InterpolationMode.BICUBIC, antialias=True),
-            CenterCrop(image_size),
-            ConvertImageDtype(torch.float32),
-            Normalize(mean, std),
-        )
-
-    def forward(self, x) -> torch.Tensor:
-        """`x` should be an instance of `PIL.Image.Image`"""
-        with torch.no_grad():
-            x = self.transforms(x)
-        return x
-
-
-class LinearMappingProcessor:
+class CLIPGPT2Processor:
     """
-    A combination of ImageProcessor and GPT2TokenizerFast
+    A combination of CLIP ImageProcessor and GPT2TokenizerFast
     """
 
-    def __init__(self, config: LinearMappingConfig):
-        self.image_processor = AutoProcessor.from_pretrained(config.image_model)
+    def __init__(self, config: CLIPGPT2Config):
+        self.image_processor = CLIPImageProcessor.from_pretrained(config.image_model)
         self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
         self.add_image_token = config.add_image_token
         if config.add_image_token:
@@ -103,7 +87,7 @@ class ImagePrefix(nn.Module):
     Converts pixel values to prefix image prompts that are later fed to a LLM
     """
 
-    def __init__(self, config: LinearMappingConfig):
+    def __init__(self, config: CLIPGPT2Config):
         super().__init__()
         clip_config = CLIPVisionConfig.from_pretrained(config.image_model)
 
@@ -126,21 +110,16 @@ class ImagePrefix(nn.Module):
         return self.ln(prefix_prompts)
 
 
-class LinearMapping(nn.Module):
+class CLIPGPT2(nn.Module):
 
-    def __init__(self, config: LinearMappingConfig):
+    def __init__(self, config: CLIPGPT2Config):
         super().__init__()
         self.image_prefix = ImagePrefix(config)
         self.language_model = GPT2LMHeadModel(AutoConfig.from_pretrained(config.text_model))
         if config.text_from_pretrained:
             self.language_model = self.language_model.from_pretrained(config.text_model)
-        self.processor = LinearMappingProcessor(config)
-        self.tokenizer = self.processor.tokenizer
-        self.image_processor = self.processor.image_processor
-        self.add_image_token = config.add_image_token
-        if config.add_image_token:
-            self.language_model.resize_token_embeddings(len(self.tokenizer))
 
+        self.language_model.resize_token_embeddings(config.vocab_size)
         if config.freeze_text_model:
             for module in self.language_model.modules():
                 if not isinstance(module, nn.LayerNorm) or config.freeze_ln:
@@ -179,7 +158,7 @@ class LinearMapping(nn.Module):
 
             for label in labels:
                 for k, token in enumerate(label):
-                    if token == self.tokenizer.eos_token_id:
+                    if token == EOS_TOKEN_ID:
                         label[k + 1:] = -100
                         break
             return {"hidden_states": inputs_embeddings, "labels": labels.to(dtype=torch.int64)}
