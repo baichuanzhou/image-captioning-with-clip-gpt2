@@ -2,7 +2,7 @@ from datasets import load_from_disk
 from clip_gpt2 import CLIPGPT2, CLIPGPT2Config, CLIPGPT2Processor
 import torch
 from torchvision.io import ImageReadMode, read_image
-from torchvision.transforms import PILToTensor
+from torchvision.transforms import PILToTensor, ToTensor
 from transformers import Trainer, TrainingArguments
 from torchvision.transforms import CenterCrop, ConvertImageDtype, Normalize, Resize
 from torchvision.transforms.functional import InterpolationMode
@@ -13,31 +13,41 @@ os.environ["WANDB_DISABLED"] = "true"
 IMAGE_COLUMN = 'image'
 
 
-
 def main():
-    ds = load_from_disk('llava_ds')
-    config = CLIPGPT2Config(additional_special_tokens_num=5, freeze_text_model=False)
+    ds = load_from_disk('caption_ds')
+    config = CLIPGPT2Config(
+        additional_special_tokens_num=1, freeze_text_model=True, text_model='gpt2', add_image_token=False
+    )
     processor = CLIPGPT2Processor(config)
     additional_special_tokens = {
         'additional_special_tokens':
-            ["<Describe>", "<Question>", "<Answer>", "<Instruction>", "|<endofprefix>|"]
+            ["|<endofprefix>|"]
     }
+
     processor.tokenizer.add_special_tokens(additional_special_tokens)
+    # end_of_prefix_position = processor.tokenizer("|<endofprefix>|", add_special_tokens=False).input_ids[0]
 
     def preprocess_complete_ds(examples):
         if config.add_image_token:
             examples['prefix'] = [
-                processor.tokenizer.cls_token + i + "|<endofprefix>|" for i in examples['prefix']
+                processor.tokenizer.cls_token + i for i in examples['prefix']
             ]
+        if "|<endofprefix>|" in processor.tokenizer.additional_special_tokens:
+            examples['prefix'] = [i + "|<endofprefix>|" for i in examples['prefix']]
         examples['text'] = [i + j for i, j in zip(examples['prefix'], examples['description'])]
+        # inputs = processor.tokenizer(
+        #     examples['text'], padding='max_length', truncation=True,
+        #     return_attention_mask=True, max_length=128, return_tensors='pt'
+        # )   # We need to postpone padding to data collator
+        # examples['input_ids'] = inputs.input_ids
+        # examples['attention_mask'] = inputs.attention_mask
         inputs = processor.tokenizer(
-            examples['text'], truncation=True,
-            return_attention_mask=True, return_special_tokens_mask=True
-        )   # We need to postpone padding to data collator
+            examples['text'], truncation=True
+        )  # We need to postpone padding to data collator
         examples['input_ids'] = inputs.input_ids
         return examples
-    print(preprocess_complete_ds(ds[:5]))
-    ds = ds.map(function=preprocess_complete_ds, batched=True, num_proc=4)
+
+    ds = ds.map(function=preprocess_complete_ds, batched=True, num_proc=16)
 
     class Transform(torch.nn.Module):
         def __init__(self, image_size, mean, std):
@@ -63,25 +73,79 @@ def main():
     image_transformations = torch.jit.script(image_transformations)
 
     def transform_images(examples):
-        images = [image.convert("RGB") for image in examples[IMAGE_COLUMN]]
+        images = [ToTensor()(image.convert('RGB')) for image in examples[IMAGE_COLUMN]]
         examples["pixel_values"] = [image_transformations(image) for image in images]
-
-        examples["attention_mask"] = torch.cat([
-            torch.ones(len(images), config.prefix_length),
-            examples["attention_mask"]
-        ], dim=1).to(dtype=torch.long)
+        # examples["attention_mask"] = torch.cat([
+        #     torch.ones(len(images), config.prefix_length),
+        #     torch.tensor(examples["attention_mask"])
+        # ], dim=1).to(dtype=torch.long)
         return examples
-    ds = ds.set_transform(transform_images)
+    ds.set_transform(transform_images)
 
     def collate_fn(batch):
-        batch['pixel_values'] = torch.stack([x['pixel_values'] for x in batch])
+        collate_batch = {'pixel_values': torch.stack([x['pixel_values'] for x in batch])}
         inputs = processor.tokenizer.pad(
-            batch['input_ids'], paddind=True, return_tensors='pt', return_attention_mask=True
+            {"input_ids": [x['input_ids'] for x in batch]},
+            padding=True, return_tensors='pt', return_attention_mask=True
         )
-        batch['input_ids'] = inputs.input_ids
-        batch['attention_mask'] = inputs.attention_mask
-        batch['lables'] = inputs.input_ids.clone()
+        collate_batch['input_ids'] = inputs.input_ids
+        batch_size = collate_batch['input_ids'].size(0)
+        """
+            concatenate the attention mask here
+        """
+        collate_batch['attention_mask'] = inputs.attention_mask
+        collate_batch["attention_mask"] = torch.cat([
+            torch.ones(batch_size, config.prefix_length),
+            collate_batch["attention_mask"]
+        ], dim=1).to(dtype=torch.long)
+        # """
+        #     construct labels for text
+        # """
+        # labels = inputs.input_ids.clone()
+        #
+        # prefix_position = (labels == end_of_prefix_position).nonzero(as_tuple=False)[:, 1]
+        # # construct mask for tokens before |<endofprefix>|
+        # mask = torch.arange(
+        #     1, labels.size(1)
+        # ).unsqueeze(0).expand_as(labels[:, 1:]) <= prefix_position.unsqueeze(1)
+        # labels[:, 1:][mask] = -100      # Leave out the image prefix
+        # for label in labels:
+        #     for k, token in enumerate(label):
+        #         if token == processor.tokenizer.eos_token_id:
+        #             label[k + 1:] = -100
+        #             break
+        # """
+        #     construct labels for image prefix
+        # """
+        # image_prefix_labels = torch.full((batch_size, config.prefix_length), -100)
+        # labels = torch.cat([image_prefix_labels, labels], dim=1).to(dtype=torch.long)
+        # collate_batch['labels'] = labels
+        return collate_batch
 
+    training_args = TrainingArguments(
+        learning_rate=5e-4,
+        lr_scheduler_type='cosine_with_restarts',
+        output_dir='outputs/clip-gpt2-large-with-complete-ds',
+        do_train=True,
+        logging_steps=50,
+        num_train_epochs=3,
+        logging_dir='runs/clip-gpt2-large-with-complete-ds',
+        remove_unused_columns=False,
+        max_grad_norm=1.0,
+        per_device_train_batch_size=64,
+        save_total_limit=3,
+        warmup_steps=1500,
+        fp16=True
+    )
+    model = CLIPGPT2(config)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds,
+        data_collator=collate_fn
+    )
+    trainer.train(resume_from_checkpoint=False)
+    trainer.save_model()
 
 
 if __name__ == '__main__':
