@@ -1,3 +1,4 @@
 coco
 .idea
 pytorch_model.bin
+pytorch_model-gpt2.bin

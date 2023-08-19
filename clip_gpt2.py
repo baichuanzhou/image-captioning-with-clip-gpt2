@@ -1,6 +1,6 @@
 from config import CLIPGPT2Config
 from transformers import (
-    GPT2TokenizerFast, GPT2LMHeadModel,
+    GPT2Tokenizer, GPT2LMHeadModel,
     CLIPVisionModel, BatchEncoding,
     CLIPImageProcessor,
     AutoConfig, CLIPVisionConfig
@@ -11,6 +11,7 @@ import torch.nn as nn
 from typing import List, Optional, Union, Tuple, Dict
 
 EOS_TOKEN_ID = 50256
+EOP_TOKEN_ID = 50258
 
 
 class CLIPGPT2Processor:
@@ -20,7 +21,7 @@ class CLIPGPT2Processor:
 
     def __init__(self, config: CLIPGPT2Config):
         self.image_processor = CLIPImageProcessor.from_pretrained(config.image_model)
-        self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         self.add_image_token = config.add_image_token
         if config.add_image_token:
             self.tokenizer.add_special_tokens({"cls_token": "|<image>|"})
@@ -93,7 +94,9 @@ class ImagePrefix(nn.Module):
 
         self.encoder = CLIPVisionModel(clip_config)
         if config.image_from_pretrained:
-            self.encoder = self.encoder.from_pretrained(config.image_model)
+            self.encoder = self.encoder.from_pretrained(
+                config.image_model
+            )
 
         if config.freeze_image_model:
             for param in self.encoder.parameters():
@@ -120,17 +123,21 @@ class CLIPGPT2(nn.Module):
             self.language_model = self.language_model.from_pretrained(config.text_model)
 
         self.language_model.resize_token_embeddings(config.vocab_size)
+        if config.additional_special_tokens_num > 0:
+            with torch.no_grad():
+                weight_mean = self.language_model.lm_head.weight[:-config.additional_special_tokens_num, :].mean(dim=0)
+                self.language_model.lm_head.weight[-config.additional_special_tokens_num:, :] = weight_mean
         if config.freeze_text_model:
             for module in self.language_model.modules():
                 if not isinstance(module, nn.LayerNorm) or config.freeze_ln:
                     for param in module.parameters():
                         param.requires_grad = False
-            if config.add_image_token:
+            if config.additional_special_tokens_num > 0:
                 # create a gradient mask for the lm_head weight and bias and hook it
                 self.language_model.lm_head.weight.requires_grad = True
                 self.weight_gradient_mask = nn.Parameter(torch.zeros_like(self.language_model.lm_head.weight),
                                                          requires_grad=False)
-                self.weight_gradient_mask[-1, :] = 1.0
+                self.weight_gradient_mask[-config.additional_special_tokens_num:, :] = 1.0
                 self.language_model.lm_head.weight.register_hook(lambda grad: grad.mul_(self.weight_gradient_mask))
 
     def prepare_text_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -154,14 +161,28 @@ class CLIPGPT2(nn.Module):
             inputs_embeddings = torch.cat([prefix_prompts, text_embeddings], dim=1)
 
             prefix_labels = torch.zeros(prefix_prompts.shape[:2], device=prefix_prompts.device) - 100
-            labels = torch.cat([prefix_labels, input_ids], dim=1)  # B x (V + T)
+            """
+                construct labels for text
+            """
+            labels = input_ids.clone()
 
+            prefix_position = (labels == EOP_TOKEN_ID).nonzero(as_tuple=False)[:, 1]
+            # construct mask for tokens before |<endofprefix>|
+            if prefix_position.size(0) > 0:
+                mask = torch.arange(
+                    0, labels.size(1)
+                ).unsqueeze(0).expand_as(labels).to(device=prefix_prompts.device) < prefix_position.unsqueeze(1)
+                labels[mask] = -100  # Leave out the image prefix
             for label in labels:
                 for k, token in enumerate(label):
                     if token == EOS_TOKEN_ID:
                         label[k + 1:] = -100
                         break
-            return {"hidden_states": inputs_embeddings, "labels": labels.to(dtype=torch.int64)}
+            """
+                construct labels for image prefix
+            """
+            labels = torch.cat([prefix_labels, labels], dim=1).to(dtype=torch.long)
+            return {"hidden_states": inputs_embeddings, "labels": labels}
 
         elif pixel_values is not None:
             prefix_prompts = self.image_prefix(pixel_values)  # B x V x D
@@ -173,7 +194,7 @@ class CLIPGPT2(nn.Module):
             labels = input_ids.clone()
             for label in labels:
                 for k, token in enumerate(label):
-                    if token == self.tokenizer.eos_token_id:
+                    if token == EOS_TOKEN_ID:
                         label[k + 1:] = -100
                         break
             return {"hidden_states": text_embeddings, "labels": labels.to(dtype=torch.int64)}
