@@ -8,6 +8,7 @@ from torchvision.transforms import CenterCrop, ConvertImageDtype, Normalize, Res
 from torchvision.transforms.functional import InterpolationMode
 import os
 from PIL import Image
+from datasets import concatenate_datasets
 
 os.environ["WANDB_DISABLED"] = "true"
 IMAGE_COLUMN = 'image'
@@ -16,7 +17,7 @@ IMAGE_COLUMN = 'image'
 def main():
     ds = load_from_disk('caption_ds')
     config = CLIPGPT2Config(
-        additional_special_tokens_num=1, freeze_text_model=True, text_model='gpt2', add_image_token=False
+        additional_special_tokens_num=1, freeze_text_model=True, text_model='gpt2-large', add_image_token=False
     )
     processor = CLIPGPT2Processor(config)
     additional_special_tokens = {
@@ -125,19 +126,21 @@ def main():
     training_args = TrainingArguments(
         learning_rate=5e-4,
         lr_scheduler_type='cosine_with_restarts',
-        output_dir='outputs/clip-gpt2-large-with-complete-ds',
+        output_dir='outputs/clip-gpt2-large-with-caption-ds',
         do_train=True,
         logging_steps=50,
         num_train_epochs=3,
-        logging_dir='runs/clip-gpt2-large-with-complete-ds',
+        logging_dir='runs/clip-gpt2-large-with-caption-ds',
         remove_unused_columns=False,
         max_grad_norm=1.0,
-        per_device_train_batch_size=64,
+        per_device_train_batch_size=16,
+        gradient_accumulation_steps=1,
         save_total_limit=3,
-        warmup_steps=1500,
-        fp16=True
+        warmup_steps=500,
+        bf16=True
     )
     model = CLIPGPT2(config)
+    # model.load_state_dict(torch.load('outputs/clip-gpt2-medium-with-caption-ds/pytorch_model.bin'), strict=False)
     trainer = Trainer(
         model=model,
         args=training_args,
