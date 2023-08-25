@@ -15,7 +15,7 @@ IMAGE_COLUMN = 'image'
 
 
 def main():
-    ds = load_from_disk('caption_ds')
+    ds = load_from_disk('multitask_ds')
     config = CLIPGPT2Config(
         additional_special_tokens_num=1, freeze_text_model=True, text_model='gpt2-large', add_image_token=False
     )
@@ -35,7 +35,14 @@ def main():
             ]
         if "|<endofprefix>|" in processor.tokenizer.additional_special_tokens:
             examples['prefix'] = [i + "|<endofprefix>|" for i in examples['prefix']]
-        examples['text'] = [i + j for i, j in zip(examples['prefix'], examples['description'])]
+        if 'task' in examples.keys():
+            examples['text'] = [
+                i + ": " + j + k for i, j, k in zip(examples['task'], examples['prefix'], examples['description'])
+            ]
+        else:
+            examples['text'] = [
+                i + j for i, j in zip(examples['prefix'], examples['description'])
+            ]
         # inputs = processor.tokenizer(
         #     examples['text'], padding='max_length', truncation=True,
         #     return_attention_mask=True, max_length=128, return_tensors='pt'
@@ -126,17 +133,17 @@ def main():
     training_args = TrainingArguments(
         learning_rate=5e-4,
         lr_scheduler_type='cosine_with_restarts',
-        output_dir='outputs/clip-gpt2-large-with-caption-ds',
+        output_dir='outputs/clip-gpt2-large-with-multitask-ds',
         do_train=True,
         logging_steps=50,
         num_train_epochs=3,
-        logging_dir='runs/clip-gpt2-large-with-caption-ds',
+        logging_dir='runs/clip-gpt2-large-with-multitask-ds',
         remove_unused_columns=False,
         max_grad_norm=1.0,
-        per_device_train_batch_size=16,
+        per_device_train_batch_size=32,
         gradient_accumulation_steps=1,
         save_total_limit=3,
-        warmup_steps=500,
+        warmup_steps=250,
         bf16=True
     )
     model = CLIPGPT2(config)
@@ -147,7 +154,7 @@ def main():
         train_dataset=ds,
         data_collator=collate_fn
     )
-    trainer.train(resume_from_checkpoint=False)
+    trainer.train(resume_from_checkpoint=True)
     trainer.save_model()
 
 

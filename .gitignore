@@ -2,3 +2,5 @@ coco
 .idea
 pytorch_model-gpt2-xl.bin
 pytorch_model-gpt2.bin
+pytorch_model-gpt2-medium.bin
+pytorch_model-gpt2-large.bin

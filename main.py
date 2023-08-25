@@ -1,8 +1,10 @@
 from datasets import load_dataset
-from linear_mapping import LinearMapping, LinearMappingProcessor, LinearMappingConfig, Transform
+from clip_gpt2 import CLIPGPT2, CLIPGPT2Config, CLIPGPT2Processor
 import torch
 from torchvision.io import ImageReadMode, read_image
 from transformers import Trainer, TrainingArguments
+from torchvision.transforms import CenterCrop, ConvertImageDtype, Normalize, Resize
+from torchvision.transforms.functional import InterpolationMode
 import os
 from PIL import Image
 os.environ["WANDB_DISABLED"] = "true"
@@ -14,8 +16,8 @@ IMAGE_COLUMN = "image_path"
 
 def main():
     ds = load_dataset("ydshieh/coco_dataset_script", "2017", DATA_DIR)
-    config = LinearMappingConfig()
-    processor = LinearMappingProcessor(config)
+    config = CLIPGPT2Config()
+    processor = CLIPGPT2Processor(config)
 
     def collate_fn(batch):
         return {
@@ -35,6 +37,22 @@ def main():
         examples["input_ids"] = inputs.input_ids
         examples["attention_mask"] = inputs.attention_mask
         return examples
+
+    class Transform(torch.nn.Module):
+        def __init__(self, image_size, mean, std):
+            super().__init__()
+            self.transforms = torch.nn.Sequential(
+                Resize([image_size], interpolation=InterpolationMode.BICUBIC, antialias=True),
+                CenterCrop(image_size),
+                ConvertImageDtype(torch.float32),
+                Normalize(mean, std),
+            )
+
+        def forward(self, x) -> torch.Tensor:
+            """`x` should be an instance of `PIL.Image.Image`"""
+            with torch.no_grad():
+                x = self.transforms(x)
+            return x
 
     image_transformations = Transform(
         config.image_resize,
@@ -102,7 +120,7 @@ def main():
         save_total_limit=3,
         warmup_steps=500
     )
-    model = LinearMapping(config)
+    model = CLIPGPT2(config)
     trainer = Trainer(
         model=model,
         args=training_args,

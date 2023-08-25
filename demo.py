@@ -2,15 +2,26 @@ import gradio as gr
 from clip_gpt2 import CLIPGPT2, CLIPGPT2Config, CLIPGPT2Processor
 import os
 import torch
+from transformers import set_seed
 
 os.environ['CURL_CA_BUNDLE'] = ''
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-config = CLIPGPT2Config(image_from_pretrained=False, text_from_pretrained=False)
-model = CLIPGPT2(config)
-model.load_state_dict(torch.load("pytorch_model.bin", map_location=device))
+set_seed(42)
+config = CLIPGPT2Config(
+    additional_special_tokens_num=1, freeze_text_model=True, text_model='gpt2-large', add_image_token=False,
+    text_from_pretrained=False
+)
 processor = CLIPGPT2Processor(config)
+additional_special_tokens = {
+    'additional_special_tokens':
+        ["|<endofprefix>|"]
+}
+
+processor.tokenizer.add_special_tokens(additional_special_tokens)
+model = CLIPGPT2(config)
+model.load_state_dict(torch.load("pytorch_model-gpt2-large.bin", map_location=device), strict=False)
 
 title = "Generate Image Captions With CLIP And GPT2"
 
@@ -24,11 +35,16 @@ def generate_image_captions(image, text):
         pixel_values=pixel_values,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        max_new_tokens=50
+        max_new_tokens=50,
+        # top_p=1.0,
+        # top_k=50,
+        # repetition_penalty=1.2,
+        # temperature=1.0,
+        # do_sample=True
     )
     processor.tokenizer.padding_side = 'left'
     processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
-    prediction_text = processor.decode(prediction[0], num_beams=5, skip_special_tokens=True)
+    prediction_text = processor.decode(prediction[0], skip_special_tokens=False)
     return prediction_text
 
 

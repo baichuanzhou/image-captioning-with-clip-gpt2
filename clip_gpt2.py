@@ -11,7 +11,8 @@ import torch.nn as nn
 from typing import List, Optional, Union, Tuple, Dict
 
 EOS_TOKEN_ID = 50256
-EOP_TOKEN_ID = 50258
+CLS_TOKEN_ID = 50257
+EOP_TOKEN_ID = 50257
 
 
 class CLIPGPT2Processor:
@@ -41,12 +42,12 @@ class CLIPGPT2Processor:
             image_features = self.image_processor(images=images, return_tensors=return_tensors, **kwargs)
             image_features["attention_mask"] = torch.ones(image_features.pixel_values.size(0),
                                                           self.prefix_length).to(dtype=torch.int64)
-            if texts is None and self.add_image_token:
-                texts = [self.tokenizer.cls_token for _ in range(image_features.pixel_values.size(0))]
-            elif texts is not None and self.add_image_token:
+            if texts is None:
+                texts = ["|<endofprefix>|" for _ in range(image_features.pixel_values.size(0))]
+            elif texts is not None:
                 if isinstance(texts, str):
                     texts = [texts]
-                texts = [self.tokenizer.cls_token + text for text in texts]
+                texts = ["|<endofprefix>|" + text for text in texts]
 
         elif texts is None:
             texts = self.tokenizer.bos_token
@@ -217,11 +218,11 @@ class CLIPGPT2(nn.Module):
             )
         batch_size = pixel_values.size(0)
         past_input_ids = None
-        if input_ids is None:
-            if self.add_image_token:
-                input_ids = torch.tensor([self.tokenizer.cls_token_id for _ in range(batch_size)]).view(batch_size, -1)
-            else:
-                input_ids = torch.tensor([self.tokenizer.bos_token_id for _ in range(batch_size)]).view(batch_size, -1)
+        # if input_ids is None:
+        #     if self.config.add_image_token:
+        #         input_ids = torch.tensor([CLS_TOKEN_ID for _ in range(batch_size)]).view(batch_size, -1)
+        #     else:
+        #         input_ids = torch.tensor([EOP_TOKEN_ID for _ in range(batch_size)]).view(batch_size, -1)
         if input_ids.size(-1) <= 1:
             first_forward_outputs = self.forward(
                 pixel_values=pixel_values

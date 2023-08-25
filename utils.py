@@ -1,20 +1,18 @@
-import torch
-from transformers import CLIPVisionModel, AutoProcessor, AutoModel
-from datasets import load_dataset
-from PIL import Image
-import requests
+from clip_gpt2 import CLIPGPT2, CLIPGPT2Config, CLIPGPT2Processor
 import os
+import torch
+from transformers import set_seed
+
 os.environ['CURL_CA_BUNDLE'] = ''
-from linear_mapping import LinearMappingConfig, LinearMappingProcessor, LinearMapping
 
-model = LinearMapping(LinearMappingConfig())
-processor = LinearMappingProcessor(LinearMappingConfig())
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-image = Image.open(requests.get(url, stream=True).raw)
-text = "Two cats lying together"
-inputs = processor(images=image, texts=text, padding="max_length", max_length=20, return_tensors="pt")
-outputs = model(**inputs)
+set_seed(42)
+config = CLIPGPT2Config(text_model='gpt2-xl', image_from_pretrained=False, text_from_pretrained=False)
+model = CLIPGPT2(config)
+model.load_state_dict(torch.load("pytorch_model-gpt2-xl.bin", map_location=device))
+processor = CLIPGPT2Processor(config)
+
 
 
 
